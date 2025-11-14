@@ -1,0 +1,19 @@
+[project]
+name = "segment-processor"
+version = "0.1.0"
+description = "Process OSM data into street segments for Mapperino"
+authors = [
+    {name = "mapperino"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "osmnx (>=2.0.6,<3.0.0)",
+    "geopandas (>=1.1.1,<2.0.0)",
+    "shapely (>=2.1.2,<3.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
