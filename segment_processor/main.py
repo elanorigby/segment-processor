@@ -23,57 +23,57 @@ import zipfile
 import tempfile
 
 
-def get_ward_boundaries():
+def get_ward_boundaries(lad_name: str):
     """
-    Download and load ward boundaries for the UK (December 2021).
+    Load ward boundaries for a specific Local Authority District (LAD).
 
-    Returns a GeoDataFrame filtered to Brent wards only.
+    Uses the May 2023 ward boundaries which include LAD information.
+
+    Args:
+        lad_name: Name of the LAD to filter by (e.g., "Brent")
+
+    Returns:
+        GeoDataFrame of ward boundaries filtered to the specified LAD.
     """
-    print("Loading ward boundaries...")
+    print(f"Loading ward boundaries for {lad_name}...")
 
-    cache_dir = Path(__file__).parent.parent / 'cache'
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Path to the May 2023 ward boundaries file (includes LAD column)
+    data_path = Path(__file__).parent.parent / 'WD_MAY_2023_UK_BGC_932649178890735580.geojson'
 
-    gpkg_path = cache_dir / 'wards_dec_2021_uk.gpkg'
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Ward boundaries file not found at {data_path}. "
+            "Please download from ONS Open Geography Portal."
+        )
 
-    # Download if not cached
-    if not gpkg_path.exists():
-        print("Downloading ward boundaries from ONS...")
-        url = "https://open-geography-portalx-ons.hub.arcgis.com/api/download/v1/items/231221d2134643a99a9abd41f565645c/geoPackage?layers=0"
-
-        urllib.request.urlretrieve(url, gpkg_path)
-        print(f"Ward boundaries downloaded to {gpkg_path}")
-    else:
-        print("Using cached ward boundaries")
-
-    # Load the geopackage
-    wards_gdf = gpd.read_file(gpkg_path)
+    # Load the GeoJSON
+    wards_gdf = gpd.read_file(data_path)
 
     print(f"Loaded {len(wards_gdf)} wards total")
-
-    # Filter to Brent wards only
-    # The data should have a LAD21NM (Local Authority District Name) or similar field
     print(f"Available columns: {list(wards_gdf.columns)}")
 
-    # Try to filter by Brent - need to check the column name
-    brent_column = None
+    # Find the LAD name column (LAD23NM for May 2023 data)
+    lad_col = None
     for col in wards_gdf.columns:
-        if 'LAD' in col and 'NM' in col:  # Looking for LAD name column
-            brent_column = col
+        if 'LAD' in col and 'NM' in col and 'NMW' not in col:
+            lad_col = col
             break
 
-    if brent_column:
-        brent_wards = wards_gdf[wards_gdf[brent_column] == 'Brent'].copy()
-        print(f"Filtered to {len(brent_wards)} wards in Brent using column '{brent_column}'")
-    else:
-        print("Warning: Could not find LAD name column, using all wards")
-        brent_wards = wards_gdf.copy()
+    if not lad_col:
+        raise ValueError("Could not find LAD name column (LAD*NM) in the data")
+
+    # Filter to the specified LAD
+    filtered_wards = wards_gdf[wards_gdf[lad_col] == lad_name].copy()
+    print(f"Filtered to {len(filtered_wards)} wards in {lad_name} using column '{lad_col}'")
+
+    if len(filtered_wards) == 0:
+        raise ValueError(f"No wards found for LAD '{lad_name}'. Check the name is correct.")
 
     # Ensure CRS is WGS84 (EPSG:4326) to match OSM data
-    if brent_wards.crs != 'EPSG:4326':
-        brent_wards = brent_wards.to_crs('EPSG:4326')
+    if filtered_wards.crs != 'EPSG:4326':
+        filtered_wards = filtered_wards.to_crs('EPSG:4326')
 
-    return brent_wards
+    return filtered_wards
 
 
 def get_brent_road_network():
@@ -100,17 +100,17 @@ def graph_to_segments(graph, wards_gdf):
 
     Args:
         graph: OSMnx graph
-        wards_gdf: GeoDataFrame of ward boundaries
+        wards_gdf: GeoDataFrame of ward boundaries (must include LAD column)
 
     Returns:
-        List of segment features with ward assignments
+        List of segment features with ward and LAD assignments
     """
     print("Converting graph to segments...")
 
     # Find the ward name column
     ward_name_col = None
     for col in wards_gdf.columns:
-        if 'WD' in col and 'NM' in col:  # Looking for Ward Name column
+        if 'WD' in col and 'NM' in col and 'NMW' not in col:
             ward_name_col = col
             break
 
@@ -118,7 +118,18 @@ def graph_to_segments(graph, wards_gdf):
         print("Warning: Could not find ward name column, using first non-geometry column")
         ward_name_col = [col for col in wards_gdf.columns if col != 'geometry'][0]
 
+    # Find the LAD name column
+    lad_name_col = None
+    for col in wards_gdf.columns:
+        if 'LAD' in col and 'NM' in col and 'NMW' not in col:
+            lad_name_col = col
+            break
+
+    if not lad_name_col:
+        raise ValueError("Could not find LAD name column (LAD*NM) in the data")
+
     print(f"Using ward name column: {ward_name_col}")
+    print(f"Using LAD name column: {lad_name_col}")
 
     segments = []
     segment_id = 0
@@ -143,28 +154,14 @@ def graph_to_segments(graph, wards_gdf):
         intersecting_wards = wards_gdf[wards_gdf.intersects(geometry)]
 
         if len(intersecting_wards) == 0:
-            # No ward found - create segment without ward
-            segment = {
-                'type': 'Feature',
-                'properties': {
-                    'id': f'segment_{segment_id}',
-                    'color': '#FF0000',
-                    'osm_id': data.get('osmid', None),
-                    'name': data.get('name', 'Unnamed'),
-                    'highway': data.get('highway', 'unknown'),
-                    'ward': None,
-                },
-                'geometry': {
-                    'type': 'LineString',
-                    'coordinates': list(geometry.coords)
-                }
-            }
-            segments.append(segment)
-            segment_id += 1
+            # No ward found - skip this segment (it's outside our LAD)
+            pass
 
         elif len(intersecting_wards) == 1:
             # Segment is entirely in one ward
-            ward_name = intersecting_wards.iloc[0][ward_name_col]
+            ward_row = intersecting_wards.iloc[0]
+            ward_name = ward_row[ward_name_col]
+            lad_name = ward_row[lad_name_col]
             segment = {
                 'type': 'Feature',
                 'properties': {
@@ -173,6 +170,7 @@ def graph_to_segments(graph, wards_gdf):
                     'osm_id': data.get('osmid', None),
                     'name': data.get('name', 'Unnamed'),
                     'highway': data.get('highway', 'unknown'),
+                    'lad': lad_name,
                     'ward': ward_name,
                 },
                 'geometry': {
@@ -188,6 +186,7 @@ def graph_to_segments(graph, wards_gdf):
             for _, ward in intersecting_wards.iterrows():
                 ward_geom = ward['geometry']
                 ward_name = ward[ward_name_col]
+                lad_name = ward[lad_name_col]
 
                 # Get the portion of the segment that's in this ward
                 try:
@@ -216,6 +215,7 @@ def graph_to_segments(graph, wards_gdf):
                                     'osm_id': data.get('osmid', None),
                                     'name': data.get('name', 'Unnamed'),
                                     'highway': data.get('highway', 'unknown'),
+                                    'lad': lad_name,
                                     'ward': ward_name,
                                 },
                                 'geometry': {
@@ -258,12 +258,15 @@ def save_geojson(segments, output_path):
 
 def main():
     """Main processing pipeline."""
+    # Configuration
+    lad_name = "Brent"
+
     print("=" * 60)
-    print("Brent Street Segment Processor")
+    print(f"{lad_name} Street Segment Processor")
     print("=" * 60)
 
-    # Step 1: Get ward boundaries
-    wards_gdf = get_ward_boundaries()
+    # Step 1: Get ward boundaries for the LAD
+    wards_gdf = get_ward_boundaries(lad_name)
 
     # Step 2: Get the road network
     graph = get_brent_road_network()
@@ -272,7 +275,8 @@ def main():
     segments = graph_to_segments(graph, wards_gdf)
 
     # Step 4: Save to file
-    output_path = Path(__file__).parent.parent / 'output' / 'brent_segments.geojson'
+    output_filename = f"{lad_name.lower().replace(' ', '_')}_segments.geojson"
+    output_path = Path(__file__).parent.parent / 'output' / output_filename
     save_geojson(segments, output_path)
 
     print("=" * 60)
