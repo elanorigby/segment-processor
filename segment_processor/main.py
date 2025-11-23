@@ -17,10 +17,43 @@ import json
 import sys
 from pathlib import Path
 from shapely.geometry import LineString, Point
+from shapely.strtree import STRtree
 import networkx as nx
 import urllib.request
 import zipfile
 import tempfile
+from pyproj import Transformer
+
+
+def get_postcode_centroids(lad_code: str):
+    """
+    Load postcode centroids for a specific Local Authority District.
+
+    Args:
+        lad_code: LAD code to filter by (e.g., "E09000005" for Brent)
+
+    Returns:
+        GeoDataFrame of postcode centroids in WGS84 (EPSG:4326)
+    """
+    print(f"Loading postcode centroids for LAD {lad_code}...")
+
+    data_path = Path(__file__).parent.parent / 'input' / 'Online_ONS_Postcode_Directory_Live_-48057019277614511.gpkg'
+
+    if not data_path.exists():
+        print(f"Warning: Postcode file not found at {data_path}. Postcodes will not be included.")
+        return None
+
+    # Load postcodes and filter to LAD
+    postcodes_gdf = gpd.read_file(data_path)
+    postcodes_gdf = postcodes_gdf[postcodes_gdf['LAD25CD'] == lad_code].copy()
+
+    print(f"Loaded {len(postcodes_gdf)} postcodes for LAD {lad_code}")
+
+    # Convert from British National Grid (EPSG:27700) to WGS84 (EPSG:4326)
+    if postcodes_gdf.crs != 'EPSG:4326':
+        postcodes_gdf = postcodes_gdf.to_crs('EPSG:4326')
+
+    return postcodes_gdf
 
 
 def get_ward_boundaries(lad_name: str):
@@ -38,7 +71,7 @@ def get_ward_boundaries(lad_name: str):
     print(f"Loading ward boundaries for {lad_name}...")
 
     # Path to the May 2023 ward boundaries file (includes LAD column)
-    data_path = Path(__file__).parent.parent / 'WD_MAY_2023_UK_BGC_932649178890735580.geojson'
+    data_path = Path(__file__).parent.parent / 'input' / 'WD_MAY_2023_UK_BGC_932649178890735580.geojson'
 
     if not data_path.exists():
         raise FileNotFoundError(
@@ -91,7 +124,7 @@ def get_brent_road_network():
     return graph
 
 
-def graph_to_segments(graph, wards_gdf):
+def graph_to_segments(graph, wards_gdf, postcodes_gdf=None, buffer_meters=30):
     """
     Convert the OSMnx graph into individual segments and split at ward boundaries.
 
@@ -101,9 +134,11 @@ def graph_to_segments(graph, wards_gdf):
     Args:
         graph: OSMnx graph
         wards_gdf: GeoDataFrame of ward boundaries (must include LAD column)
+        postcodes_gdf: Optional GeoDataFrame of postcode centroids
+        buffer_meters: Buffer distance in meters for postcode matching
 
     Returns:
-        List of segment features with ward and LAD assignments
+        List of segment features with ward, LAD, and postcode assignments
     """
     print("Converting graph to segments...")
 
@@ -130,6 +165,32 @@ def graph_to_segments(graph, wards_gdf):
 
     print(f"Using ward name column: {ward_name_col}")
     print(f"Using LAD name column: {lad_name_col}")
+
+    # Set up postcode spatial index if postcodes are provided
+    postcode_tree = None
+    postcode_points = None
+    postcode_codes = None
+    # Buffer in degrees (approximate: 30m ~ 0.00027 degrees at London's latitude)
+    buffer_degrees = buffer_meters / 111000
+
+    if postcodes_gdf is not None and len(postcodes_gdf) > 0:
+        print(f"Building spatial index for {len(postcodes_gdf)} postcodes...")
+        postcode_points = list(postcodes_gdf.geometry)
+        postcode_codes = list(postcodes_gdf['PCDS'])
+        postcode_tree = STRtree(postcode_points)
+        print("Spatial index built.")
+
+    def find_postcodes_for_geometry(geom):
+        """Find all postcodes within buffer distance of a geometry."""
+        if postcode_tree is None:
+            return []
+        # Buffer the geometry to find nearby postcodes
+        buffered = geom.buffer(buffer_degrees)
+        # Query the spatial index
+        candidate_indices = postcode_tree.query(buffered)
+        # Get the postcodes for matching points
+        postcodes = sorted(set(postcode_codes[i] for i in candidate_indices))
+        return postcodes
 
     segments = []
     segment_id = 0
@@ -162,6 +223,7 @@ def graph_to_segments(graph, wards_gdf):
             ward_row = intersecting_wards.iloc[0]
             ward_name = ward_row[ward_name_col]
             lad_name = ward_row[lad_name_col]
+            postcodes = find_postcodes_for_geometry(geometry)
             segment = {
                 'type': 'Feature',
                 'properties': {
@@ -172,6 +234,7 @@ def graph_to_segments(graph, wards_gdf):
                     'highway': data.get('highway', 'unknown'),
                     'lad': lad_name,
                     'ward': ward_name,
+                    'postcodes': postcodes,
                 },
                 'geometry': {
                     'type': 'LineString',
@@ -207,6 +270,7 @@ def graph_to_segments(graph, wards_gdf):
 
                     for line in lines_to_add:
                         if line.length > 0:  # Only add non-zero length segments
+                            postcodes = find_postcodes_for_geometry(line)
                             segment = {
                                 'type': 'Feature',
                                 'properties': {
@@ -217,6 +281,7 @@ def graph_to_segments(graph, wards_gdf):
                                     'highway': data.get('highway', 'unknown'),
                                     'lad': lad_name,
                                     'ward': ward_name,
+                                    'postcodes': postcodes,
                                 },
                                 'geometry': {
                                     'type': 'LineString',
@@ -260,6 +325,7 @@ def main():
     """Main processing pipeline."""
     # Configuration
     lad_name = "Brent"
+    lad_code = "E09000005"  # ONS code for Brent
 
     print("=" * 60)
     print(f"{lad_name} Street Segment Processor")
@@ -268,13 +334,16 @@ def main():
     # Step 1: Get ward boundaries for the LAD
     wards_gdf = get_ward_boundaries(lad_name)
 
-    # Step 2: Get the road network
+    # Step 2: Get postcode centroids for the LAD
+    postcodes_gdf = get_postcode_centroids(lad_code)
+
+    # Step 3: Get the road network
     graph = get_brent_road_network()
 
-    # Step 3: Convert to segments and assign wards (splitting at boundaries)
-    segments = graph_to_segments(graph, wards_gdf)
+    # Step 4: Convert to segments and assign wards (splitting at boundaries)
+    segments = graph_to_segments(graph, wards_gdf, postcodes_gdf)
 
-    # Step 4: Save to file
+    # Step 5: Save to file
     output_filename = f"{lad_name.lower().replace(' ', '_')}_segments.geojson"
     output_path = Path(__file__).parent.parent / 'output' / output_filename
     save_geojson(segments, output_path)
