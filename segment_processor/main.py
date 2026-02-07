@@ -11,12 +11,16 @@ This script:
 6. Exports segments as GeoJSON with ward information
 """
 
+import math
+
 import osmnx as ox
 import geopandas as gpd
 import json
 import sys
 from pathlib import Path
 from shapely.geometry import LineString, Point
+from shapely import offset_curve
+from shapely.ops import linemerge
 from shapely.strtree import STRtree
 import networkx as nx
 import urllib.request
@@ -124,6 +128,125 @@ def get_brent_road_network():
     return graph
 
 
+def _resolve_ward(line_geom, ward_geoms, ward_names, ward_tree):
+    """Return the ward name covering the majority of line_geom by intersection length."""
+    hits = ward_tree.query(line_geom, predicate='intersects')
+    if len(hits) == 0:
+        return None
+    if len(hits) == 1:
+        return ward_names[hits[0]]
+    best_name = None
+    best_length = 0
+    for idx in hits:
+        try:
+            piece = line_geom.intersection(ward_geoms[idx])
+            if piece.length > best_length:
+                best_length = piece.length
+                best_name = ward_names[idx]
+        except Exception:
+            continue
+    return best_name
+
+
+def _get_cardinal_sides(geometry):
+    """Return (positive_offset_label, negative_offset_label) cardinal directions.
+
+    For an east-west road the sides are N/S; for north-south they are E/W.
+    Positive offset_curve distance offsets to the *left* of the line direction.
+    """
+    coords = list(geometry.coords)
+    dx = coords[-1][0] - coords[0][0]
+    dy = coords[-1][1] - coords[0][1]
+    bearing = math.degrees(math.atan2(dx, dy)) % 360  # 0=N, 90=E
+    # Normalize to 0-180 (direction-agnostic orientation)
+    orientation = bearing % 180
+
+    if 45 <= orientation < 135:
+        # Road runs mostly east-west
+        # Heading east (bearing ~90): left=N, right=S
+        # Heading west (bearing ~270): left=S, right=N
+        if 0 <= bearing < 180:
+            return ("N", "S")
+        else:
+            return ("S", "N")
+    else:
+        # Road runs mostly north-south
+        # Heading north (bearing ~0): left=W, right=E
+        # Heading south (bearing ~180): left=E, right=W
+        if 90 <= bearing < 270:
+            return ("E", "W")
+        else:
+            return ("W", "E")
+
+
+def _make_side_features(segment_id, geometry, data, ward_geoms, ward_names, ward_tree,
+                        ward_to_lad, fallback_ward, fallback_lad, offset_degrees, find_postcodes_fn):
+    """Build two GeoJSON features (one per side) for any road segment.
+
+    Offsets the geometry left and right, resolves each side's ward independently,
+    and falls back to *fallback_ward* when a side can't be resolved.
+    """
+    pos_label, neg_label = _get_cardinal_sides(geometry)
+
+    # Try to compute offset curves for each side
+    try:
+        left_line = offset_curve(geometry, offset_degrees)
+        right_line = offset_curve(geometry, -offset_degrees)
+
+        if left_line.is_empty or right_line.is_empty:
+            raise ValueError("empty offset")
+
+        if left_line.geom_type == 'MultiLineString':
+            left_line = linemerge(left_line)
+        if right_line.geom_type == 'MultiLineString':
+            right_line = linemerge(right_line)
+
+        left_ward = _resolve_ward(left_line, ward_geoms, ward_names, ward_tree) or fallback_ward
+        right_ward = _resolve_ward(right_line, ward_geoms, ward_names, ward_tree) or fallback_ward
+    except Exception:
+        # Offset failed — use original geometry for both sides
+        left_line = geometry
+        right_line = geometry
+        left_ward = fallback_ward
+        right_ward = fallback_ward
+
+    pair_id = f'segment_{segment_id}'
+    features = []
+
+    for cardinal, ward_name, line_geom in [
+        (pos_label, left_ward, left_line),
+        (neg_label, right_ward, right_line),
+    ]:
+        lad = ward_to_lad.get(ward_name, fallback_lad)
+        postcodes = find_postcodes_fn(line_geom)
+        geom_type = 'MultiLineString' if line_geom.geom_type == 'MultiLineString' else 'LineString'
+        if geom_type == 'MultiLineString':
+            coords = [list(part.coords) for part in line_geom.geoms]
+        else:
+            coords = list(line_geom.coords)
+        feature = {
+            'type': 'Feature',
+            'properties': {
+                'id': f'segment_{segment_id}_{cardinal}',
+                'pair_id': pair_id,
+                'side': cardinal,
+                'color': '#FF0000',
+                'osm_id': data.get('osmid', None),
+                'name': data.get('name', 'Unnamed'),
+                'highway': data.get('highway', 'unknown'),
+                'lad': lad,
+                'ward': ward_name,
+                'postcodes': postcodes,
+            },
+            'geometry': {
+                'type': geom_type,
+                'coordinates': coords,
+            }
+        }
+        features.append(feature)
+    return features
+
+
 def graph_to_segments(graph, wards_gdf, postcodes_gdf=None, buffer_meters=30):
     """
     Convert the OSMnx graph into individual segments and split at ward boundaries.
@@ -165,6 +288,13 @@ def graph_to_segments(graph, wards_gdf, postcodes_gdf=None, buffer_meters=30):
 
     print(f"Using ward name column: {ward_name_col}")
     print(f"Using LAD name column: {lad_name_col}")
+
+    # Ward data structures for boundary-road detection
+    ward_geom_list = list(wards_gdf.geometry)
+    ward_name_list = list(wards_gdf[ward_name_col])
+    ward_spatial_tree = STRtree(ward_geom_list)
+    ward_to_lad = dict(zip(wards_gdf[ward_name_col], wards_gdf[lad_name_col]))
+    offset_degrees = 4.0 / 111000  # ~4 meters at London latitude
 
     # Set up postcode spatial index if postcodes are provided
     postcode_tree = None
@@ -218,81 +348,53 @@ def graph_to_segments(graph, wards_gdf, postcodes_gdf=None, buffer_meters=30):
             # No ward found - skip this segment (it's outside our LAD)
             pass
 
-        elif len(intersecting_wards) == 1:
-            # Segment is entirely in one ward
+        elif len(intersecting_wards) <= 1:
+            # Segment is in one ward — produce two side features
             ward_row = intersecting_wards.iloc[0]
-            ward_name = ward_row[ward_name_col]
-            lad_name = ward_row[lad_name_col]
-            postcodes = find_postcodes_for_geometry(geometry)
-            segment = {
-                'type': 'Feature',
-                'properties': {
-                    'id': f'segment_{segment_id}',
-                    'color': '#FF0000',
-                    'osm_id': data.get('osmid', None),
-                    'name': data.get('name', 'Unnamed'),
-                    'highway': data.get('highway', 'unknown'),
-                    'lad': lad_name,
-                    'ward': ward_name,
-                    'postcodes': postcodes,
-                },
-                'geometry': {
-                    'type': 'LineString',
-                    'coordinates': list(geometry.coords)
-                }
-            }
-            segments.append(segment)
+            fallback_ward = ward_row[ward_name_col]
+            fallback_lad = ward_row[lad_name_col]
+            features = _make_side_features(
+                segment_id, geometry, data,
+                ward_geom_list, ward_name_list, ward_spatial_tree,
+                ward_to_lad, fallback_ward, fallback_lad,
+                offset_degrees, find_postcodes_for_geometry,
+            )
+            segments.extend(features)
             segment_id += 1
 
         else:
-            # Segment crosses multiple wards - split it
+            # Segment crosses multiple wards — split at ward boundaries,
+            # then produce two side features for each piece
             for _, ward in intersecting_wards.iterrows():
                 ward_geom = ward['geometry']
                 ward_name = ward[ward_name_col]
                 lad_name = ward[lad_name_col]
 
-                # Get the portion of the segment that's in this ward
                 try:
                     intersection = geometry.intersection(ward_geom)
 
-                    # Only process if intersection is a LineString
                     if intersection.is_empty:
                         continue
 
-                    # Handle MultiLineString results
                     if intersection.geom_type == 'LineString':
                         lines_to_add = [intersection]
                     elif intersection.geom_type == 'MultiLineString':
                         lines_to_add = list(intersection.geoms)
                     else:
-                        # Skip points or other geometry types
                         continue
 
                     for line in lines_to_add:
-                        if line.length > 0:  # Only add non-zero length segments
-                            postcodes = find_postcodes_for_geometry(line)
-                            segment = {
-                                'type': 'Feature',
-                                'properties': {
-                                    'id': f'segment_{segment_id}',
-                                    'color': '#FF0000',
-                                    'osm_id': data.get('osmid', None),
-                                    'name': data.get('name', 'Unnamed'),
-                                    'highway': data.get('highway', 'unknown'),
-                                    'lad': lad_name,
-                                    'ward': ward_name,
-                                    'postcodes': postcodes,
-                                },
-                                'geometry': {
-                                    'type': 'LineString',
-                                    'coordinates': list(line.coords)
-                                }
-                            }
-                            segments.append(segment)
+                        if line.length > 0:
+                            features = _make_side_features(
+                                segment_id, line, data,
+                                ward_geom_list, ward_name_list, ward_spatial_tree,
+                                ward_to_lad, ward_name, lad_name,
+                                offset_degrees, find_postcodes_for_geometry,
+                            )
+                            segments.extend(features)
                             segment_id += 1
 
                 except Exception as e:
-                    # If intersection fails, skip this ward
                     print(f"Warning: Failed to split segment at ward boundary: {e}")
                     continue
 
