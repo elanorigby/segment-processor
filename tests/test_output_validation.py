@@ -8,6 +8,8 @@ import re
 
 import pytest
 
+from segment_processor.main import EXCLUDED_HIGHWAY_TYPES
+
 
 class TestOutputValidation:
     def test_valid_geojson_structure(self, geojson_data):
@@ -124,3 +126,20 @@ class TestOutputValidation:
         for f in geojson_data["features"]:
             assert isinstance(f["properties"]["ward"], str) and f["properties"]["ward"]
             assert isinstance(f["properties"]["lad"], str) and f["properties"]["lad"]
+
+    def test_no_excluded_highway_types(self, geojson_data):
+        """No features with excluded highway types, unless they are named footways."""
+        for f in geojson_data["features"]:
+            highway = f["properties"]["highway"]
+            if isinstance(highway, list):
+                highway_types = set(highway)
+            else:
+                highway_types = {highway}
+            if not (highway_types and highway_types <= EXCLUDED_HIGHWAY_TYPES):
+                continue
+            # Named footways are allowed through
+            name = f["properties"].get("name", "")
+            is_named_footway = bool(name) and "footway" in highway_types
+            assert is_named_footway, (
+                f"Feature {f['properties']['id']} has excluded highway type: {highway}"
+            )

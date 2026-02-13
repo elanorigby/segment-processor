@@ -1,6 +1,7 @@
 """Integration tests for graph_to_segments()."""
 
 import pytest
+from shapely.geometry import LineString
 
 from segment_processor.main import graph_to_segments
 
@@ -94,6 +95,67 @@ class TestGraphToSegments:
         # Edge 1→2 (osmid=101) has no geometry attribute — produces 2 side features
         interior = [s for s in segments if s["properties"]["osm_id"] == 101]
         assert len(interior) == 2
+
+    def test_unnamed_footway_filtered_out(self, simple_graph, two_adjacent_wards):
+        """Unnamed footway edges are excluded from output."""
+        segments = self._run(simple_graph, two_adjacent_wards)
+        footway = [s for s in segments if s["properties"]["osm_id"] == 105]
+        assert len(footway) == 0
+
+    def test_named_footway_kept(self, simple_graph, two_adjacent_wards):
+        """Named footway edges are kept (residential access paths)."""
+        segments = self._run(simple_graph, two_adjacent_wards)
+        named_footway = [s for s in segments if s["properties"]["osm_id"] == 110]
+        assert len(named_footway) >= 2  # kept and split into sides
+
+    def test_cycleway_filtered_out(self, simple_graph, two_adjacent_wards):
+        """Cycleway edges are excluded from output."""
+        segments = self._run(simple_graph, two_adjacent_wards)
+        cycleway = [s for s in segments if s["properties"]["osm_id"] == 106]
+        assert len(cycleway) == 0
+
+    def test_unnamed_service_filtered_out(self, simple_graph, two_adjacent_wards):
+        """Unnamed service roads are excluded from output."""
+        segments = self._run(simple_graph, two_adjacent_wards)
+        unnamed_svc = [s for s in segments if s["properties"]["osm_id"] == 111]
+        assert len(unnamed_svc) == 0
+
+    def test_named_service_kept(self, simple_graph, two_adjacent_wards):
+        """Named service roads are kept."""
+        segments = self._run(simple_graph, two_adjacent_wards)
+        named_svc = [s for s in segments if s["properties"]["osm_id"] == 112]
+        assert len(named_svc) >= 2  # kept and split into sides
+
+    def test_link_road_filtered_out(self, simple_graph, two_adjacent_wards):
+        """Link road edges (e.g. trunk_link) are excluded from output."""
+        segments = self._run(simple_graph, two_adjacent_wards)
+        link = [s for s in segments if s["properties"]["osm_id"] == 107]
+        assert len(link) == 0
+
+    def test_list_highway_all_excluded(self, simple_graph, two_adjacent_wards):
+        """Unnamed edge with highway=['footway','path'] (all excluded) is filtered out."""
+        simple_graph.add_edge(
+            1, 2, key=2,
+            osmid=108,
+            highway=["footway", "path"],
+            geometry=LineString([(-0.28, 51.549), (-0.27, 51.549)]),
+        )
+        segments = self._run(simple_graph, two_adjacent_wards)
+        multi = [s for s in segments if s["properties"]["osm_id"] == 108]
+        assert len(multi) == 0
+
+    def test_list_highway_partially_excluded(self, simple_graph, two_adjacent_wards):
+        """Edge with highway=['footway','residential'] (not all excluded) is kept."""
+        simple_graph.add_edge(
+            1, 2, key=3,
+            osmid=109,
+            name="Mixed Tag Road",
+            highway=["footway", "residential"],
+            geometry=LineString([(-0.28, 51.548), (-0.27, 51.548)]),
+        )
+        segments = self._run(simple_graph, two_adjacent_wards)
+        mixed = [s for s in segments if s["properties"]["osm_id"] == 109]
+        assert len(mixed) >= 2  # kept and split into sides
 
     def test_missing_lad_col_raises(self, simple_graph):
         """Ward GDF without LAD*NM column → ValueError."""

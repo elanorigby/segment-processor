@@ -129,6 +129,16 @@ def get_brent_road_network():
     return graph
 
 
+# Highway types to exclude — not relevant for doorknocking canvassers.
+# Includes footways, cycleways, paths, and slip-road links.
+EXCLUDED_HIGHWAY_TYPES = {
+    "footway", "cycleway", "path", "steps",
+    "bridleway", "corridor", "track",
+    "motorway_link", "trunk_link", "primary_link",
+    "secondary_link", "tertiary_link",
+}
+
+
 def _resolve_ward(line_geom, ward_geoms, ward_names, ward_tree):
     """Return the ward name covering the majority of line_geom by intersection length."""
     hits = ward_tree.query(line_geom, predicate='intersects')
@@ -330,6 +340,29 @@ def graph_to_segments(graph, wards_gdf, postcodes_gdf=None, buffer_meters=30):
     processed = 0
 
     for u, v, key, data in graph.edges(keys=True, data=True):
+        # Skip highway types not relevant for doorknocking
+        highway = data.get('highway', '')
+        # osmnx may return a list when an edge has multiple highway tags
+        if isinstance(highway, list):
+            highway_types = set(highway)
+        else:
+            highway_types = {highway}
+        if highway_types and highway_types <= EXCLUDED_HIGHWAY_TYPES:
+            # Keep named footways — they're often residential access paths
+            name = data.get('name', '')
+            is_named = bool(name) if not isinstance(name, list) else bool(name[0])
+            if not (is_named and 'footway' in highway_types):
+                processed += 1
+                continue
+
+        # Skip unnamed service roads (parking aisles, driveways, cemetery paths, etc.)
+        if 'service' in highway_types:
+            name = data.get('name', '')
+            is_named = bool(name) if not isinstance(name, list) else bool(name[0])
+            if not is_named:
+                processed += 1
+                continue
+
         # Get the geometry of this edge
         if 'geometry' in data:
             geometry = data['geometry']
