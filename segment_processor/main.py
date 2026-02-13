@@ -12,6 +12,7 @@ This script:
 """
 
 import math
+from datetime import datetime
 
 import osmnx as ox
 import geopandas as gpd
@@ -445,8 +446,12 @@ def main():
     # Step 4: Convert to segments and assign wards (splitting at boundaries)
     segments = graph_to_segments(graph, wards_gdf, postcodes_gdf)
 
-    # Step 5: Save to file
-    output_filename = f"{lad_name.lower().replace(' ', '_')}_segments.geojson"
+    # Step 5: Remove sidewalk footways that duplicate carriageway segments
+    segments = filter_redundant_footways(segments)
+
+    # Step 6: Save to file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_filename = f"{lad_name.lower().replace(' ', '_')}_segments_{timestamp}.geojson"
     output_path = Path(__file__).parent.parent / 'output' / output_filename
     save_geojson(segments, output_path)
 

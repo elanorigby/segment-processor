@@ -166,13 +166,76 @@ def simple_graph():
         geometry=LineString([(-0.22, 51.55), (-0.10, 52.00)]),
     )
 
+    # Unnamed footway edge: should be filtered out
+    G.add_edge(
+        1, 2, key=1,
+        osmid=105,
+        highway="footway",
+        geometry=LineString([(-0.28, 51.5505), (-0.27, 51.5505)]),
+    )
+
+    # Named footway edge: should be KEPT (residential access path)
+    G.add_edge(
+        1, 2, key=4,
+        osmid=110,
+        name="Doyle Gardens",
+        highway="footway",
+        geometry=LineString([(-0.28, 51.5510), (-0.27, 51.5510)]),
+    )
+
+    # Cycleway edge: should be filtered out
+    G.add_edge(
+        3, 4, key=1,
+        osmid=106,
+        name="Beta Cycle Path",
+        highway="cycleway",
+        geometry=LineString([(-0.23, 51.5495), (-0.22, 51.5495)]),
+    )
+
+    # Link road edge: should be filtered out
+    G.add_edge(
+        2, 3, key=1,
+        osmid=107,
+        name="Trunk Slip Road",
+        highway="trunk_link",
+        geometry=LineString([(-0.27, 51.551), (-0.23, 51.551)]),
+    )
+
+    # Unnamed service road: should be filtered out
+    G.add_edge(
+        1, 2, key=5,
+        osmid=111,
+        highway="service",
+        geometry=LineString([(-0.28, 51.5515), (-0.27, 51.5515)]),
+    )
+
+    # Named service road: should be kept
+    G.add_edge(
+        1, 2, key=6,
+        osmid=112,
+        name="Alpha Mews",
+        highway="service",
+        geometry=LineString([(-0.28, 51.5520), (-0.27, 51.5520)]),
+    )
+
     return G
 
 
 @pytest.fixture(scope="session")
 def geojson_data(request):
-    """Load real output GeoJSON file. Skip if not found."""
+    """Load real output GeoJSON file. Skip if not found.
+
+    If --geojson is not specified, uses the most recent brent_segments_*.geojson
+    file in the output/ directory.
+    """
+    from pathlib import Path
+
     path = request.config.getoption("--geojson")
+    if path == "output/brent_segments.geojson":
+        # Default value — look for the most recent timestamped file instead
+        candidates = sorted(Path("output").glob("brent_segments_*.geojson"))
+        if candidates:
+            path = str(candidates[-1])
     try:
         with open(path) as f:
             data = json.load(f)
