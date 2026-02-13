@@ -440,6 +440,97 @@ def graph_to_segments(graph, wards_gdf, postcodes_gdf=None, buffer_meters=30):
     return segments
 
 
+# Highway types considered low-priority pedestrian ways for deduplication.
+_FOOTWAY_TYPES = {"footway", "path"}
+
+# Highway types considered carriageways (roads with houses).
+_ROAD_TYPES = {"tertiary", "secondary", "primary", "residential", "unclassified", "trunk"}
+
+
+def filter_redundant_footways(segments, threshold_m=15):
+    """Remove footway/path segments that duplicate a nearby road segment.
+
+    Sidewalk footways mapped parallel to a carriageway with the same street
+    name produce redundant overlapping features. This drops the footway and
+    keeps the road.
+    """
+    # Rough conversion at London latitude
+    meters_per_degree = 111_000
+
+    # --- 1. Index segments by pair_id, pick one side per pair for midpoint ---
+    pair_segments = {}  # pair_id → list of features
+    pair_midpoints = {}  # pair_id → (mid_x, mid_y)
+    pair_info = {}  # pair_id → {name, highway}
+
+    for feat in segments:
+        props = feat["properties"]
+        pid = props["pair_id"]
+        pair_segments.setdefault(pid, []).append(feat)
+
+        if pid not in pair_midpoints:
+            coords = feat["geometry"]["coordinates"]
+            if feat["geometry"]["type"] == "MultiLineString":
+                # Flatten to get rough midpoint
+                flat = [c for part in coords for c in part]
+            else:
+                flat = coords
+            mid_idx = len(flat) // 2
+            pair_midpoints[pid] = flat[mid_idx]
+            pair_info[pid] = {"name": props.get("name"), "highway": props.get("highway")}
+
+    # --- 2. Classify each pair as footway or road ---
+    def _to_set(val):
+        if isinstance(val, list):
+            return set(val)
+        return {val} if val else set()
+
+    def _names(val):
+        if isinstance(val, list):
+            return set(val)
+        return {val} if val else set()
+
+    footway_pids = []
+    road_pids_by_name = {}  # name → [pid, ...]
+
+    for pid, info in pair_info.items():
+        hw_types = _to_set(info["highway"])
+        names = _names(info["name"])
+
+        if hw_types & _FOOTWAY_TYPES:
+            footway_pids.append(pid)
+        if hw_types & _ROAD_TYPES:
+            for n in names:
+                road_pids_by_name.setdefault(n, []).append(pid)
+
+    # --- 3. Check each footway against same-name roads ---
+    drop_pids = set()
+
+    for pid in footway_pids:
+        names = _names(pair_info[pid]["name"])
+        fx, fy = pair_midpoints[pid]
+
+        for name in names:
+            if name not in road_pids_by_name:
+                continue
+            for road_pid in road_pids_by_name[name]:
+                rx, ry = pair_midpoints[road_pid]
+                dx = (fx - rx) * meters_per_degree
+                dy = (fy - ry) * meters_per_degree
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist < threshold_m:
+                    drop_pids.add(pid)
+                    break
+            if pid in drop_pids:
+                break
+
+    # --- 4. Rebuild list without dropped pairs ---
+    if drop_pids:
+        dropped_count = sum(len(pair_segments[pid]) for pid in drop_pids)
+        print(f"Filtered {len(drop_pids)} redundant footway pairs ({dropped_count} features)")
+
+    return [f for f in segments if f["properties"]["pair_id"] not in drop_pids]
+
+
 def save_geojson(segments, output_path):
     """Save segments to a GeoJSON file."""
     print(f"Saving to {output_path}...")
